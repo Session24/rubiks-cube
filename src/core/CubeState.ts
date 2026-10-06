@@ -33,6 +33,11 @@ import {
 } from './geometry';
 import type { AxisIndex, FaceDef } from './geometry';
 
+/** A stride of a rotation of the sticker grid: one step along a row or a column. */
+function isGridStride(value: number, n: number): boolean {
+  return value === 1 || value === -1 || value === n || value === -n;
+}
+
 export class CubeState {
   public readonly size: number;
   public readonly faces: {
@@ -51,6 +56,8 @@ export class CubeState {
   private readonly scratch: Record<FaceName, Uint8Array>;
   /** Reusable coordinate triplet for the hot loop. */
   private readonly coordBuf = new Int32Array(3);
+  /** Reused [base, dc, dr] coefficients of the derived index map (no allocation). */
+  private readonly mapBuf = new Int32Array(3);
 
   constructor(size: number) {
     if (size < 2) throw new Error('Cube size must be at least 2');
@@ -217,32 +224,12 @@ export class CubeState {
     for (const name of affected) {
       const def = FACE_DEFS[name];
       const src = this.faces[name];
-      // Every cell of one face moves onto the same target face, so this is computed
+      // Every cell of one face lands on the same target face, so this is computed
       // once per face: rotateFaceNormal allocates, and doing it per cell made an
       // N=1000 batch scramble allocate millions of short lived objects.
       const targetDef = this.targetFace(def, axis, dir);
-
-      if (def.fixedAxis === axis) {
-        // The whole face lies inside the slab (outer layers only).
-        for (let row = 0; row < n; row++) {
-          const base = row * n;
-          for (let col = 0; col < n; col++) {
-            this.moveCell(def, targetDef, col, row, src[base + col], axis, dir, n);
-          }
-        }
-      } else if (def.uAxis === axis) {
-        // The slab crosses this face as a vertical strip (one column).
-        const col = def.uSign > 0 ? layer : n - 1 - layer;
-        for (let row = 0; row < n; row++) {
-          this.moveCell(def, targetDef, col, row, src[row * n + col], axis, dir, n);
-        }
-      } else {
-        // The slab crosses this face as a horizontal strip (one row).
-        const row = def.vSign > 0 ? layer : n - 1 - layer;
-        const base = row * n;
-        for (let col = 0; col < n; col++) {
-          this.moveCell(def, targetDef, col, row, src[base + col], axis, dir, n);
-        }
+      if (!this.writeFast(def, targetDef, src, axis, layer, dir, n)) {
+        this.writeGeneric(def, targetDef, src, axis, layer, dir, n);
       }
     }
 
@@ -271,11 +258,149 @@ export class CubeState {
   }
 
   /**
+   * Face that every cell of `def` lands on for this quarter turn.
+   * Depends only on (face, axis, direction), so it belongs outside the cell loop.
+   */
+  private targetFace(def: FaceDef, axis: AxisIndex, dir: 1 | -1): FaceDef {
+    const normal = rotateFaceNormal(def, axis, dir);
+    return FACE_DEFS[faceForNormal(normal.axis, normal.max)];
+  }
+
+  /**
+   * Flat index of the cell that `def(col,row)` moves onto, evaluated with the
+   * generic (trusted) pipeline.
+   */
+  private cellIndex(
+    def: FaceDef,
+    targetDef: FaceDef,
+    col: number,
+    row: number,
+    axis: AxisIndex,
+    dir: 1 | -1,
+    n: number,
+  ): number {
+    const coords = this.coordBuf;
+    faceCellCoords(def, col, row, n, coords);
+    rotateCoords(coords, axis, dir, n);
+    return faceRow(targetDef, coords, n) * n + faceCol(targetDef, coords, n);
+  }
+
+  /**
+   * A quarter turn is a rigid rotation of the sticker grid, so in flat indices the
+   * destination is affine in (col, row): `base + dc*col + dr*row` with the strides
+   * being ±1 or ±n. Deriving those three coefficients from a few evaluations of the
+   * generic pipeline - and checking the model against two more of them - lets the
+   * hot loop be a plain indexed copy instead of four helper calls per cell.
+   *
+   * Returns false when the model does not hold; the caller then falls back to the
+   * generic path, so correctness never depends on this optimisation.
+   */
+  private deriveMap(
+    def: FaceDef,
+    targetDef: FaceDef,
+    axis: AxisIndex,
+    dir: 1 | -1,
+    n: number,
+  ): boolean {
+    const i00 = this.cellIndex(def, targetDef, 0, 0, axis, dir, n);
+    const dc = this.cellIndex(def, targetDef, 1, 0, axis, dir, n) - i00;
+    const dr = this.cellIndex(def, targetDef, 0, 1, axis, dir, n) - i00;
+
+    if (!isGridStride(dc, n) || !isGridStride(dr, n)) return false;
+
+    const check = (col: number, row: number): boolean =>
+      this.cellIndex(def, targetDef, col, row, axis, dir, n) === i00 + dc * col + dr * row;
+
+    if (!check(1, 1)) return false;
+    if (n > 2 && !check(n - 1, n - 1)) return false;
+
+    this.mapBuf[0] = i00;
+    this.mapBuf[1] = dc;
+    this.mapBuf[2] = dr;
+    return true;
+  }
+
+  /**
+   * Fast path: write the slab's cells through the derived index map.
+   * Returns false when the model was rejected, in which case the caller must use
+   * {@link writeGeneric}.
+   */
+  private writeFast(
+    def: FaceDef,
+    targetDef: FaceDef,
+    src: Uint8Array,
+    axis: AxisIndex,
+    layer: number,
+    dir: 1 | -1,
+    n: number,
+  ): boolean {
+    if (!this.deriveMap(def, targetDef, axis, dir, n)) return false;
+
+    const base = this.mapBuf[0];
+    const dc = this.mapBuf[1];
+    const dr = this.mapBuf[2];
+    const dst = this.scratch[targetDef.name];
+
+    if (def.fixedAxis === axis) {
+      // The whole face lies inside the slab (outer layers only).
+      for (let row = 0; row < n; row++) {
+        const s = row * n;
+        const d = base + dr * row;
+        for (let col = 0; col < n; col++) dst[d + dc * col] = src[s + col];
+      }
+    } else if (def.uAxis === axis) {
+      // The slab crosses this face as a vertical strip (one column).
+      const col = def.uSign > 0 ? layer : n - 1 - layer;
+      const d = base + dc * col;
+      for (let row = 0; row < n; row++) dst[d + dr * row] = src[row * n + col];
+    } else {
+      // The slab crosses this face as a horizontal strip (one row).
+      const row = def.vSign > 0 ? layer : n - 1 - layer;
+      const d = base + dr * row;
+      for (let col = 0; col < n; col++) dst[d + dc * col] = src[row * n + col];
+    }
+    return true;
+  }
+
+  /** Reference path: one generic cell computation per sticker. Always correct. */
+  private writeGeneric(
+    def: FaceDef,
+    targetDef: FaceDef,
+    src: Uint8Array,
+    axis: AxisIndex,
+    layer: number,
+    dir: 1 | -1,
+    n: number,
+  ): void {
+    if (def.fixedAxis === axis) {
+      for (let row = 0; row < n; row++) {
+        const s = row * n;
+        for (let col = 0; col < n; col++) {
+          this.moveCell(def, targetDef, col, row, src[s + col], axis, dir, n);
+        }
+      }
+    } else if (def.uAxis === axis) {
+      const col = def.uSign > 0 ? layer : n - 1 - layer;
+      for (let row = 0; row < n; row++) {
+        this.moveCell(def, targetDef, col, row, src[row * n + col], axis, dir, n);
+      }
+    } else {
+      const row = def.vSign > 0 ? layer : n - 1 - layer;
+      const s = row * n;
+      for (let col = 0; col < n; col++) {
+        this.moveCell(def, targetDef, col, row, src[s + col], axis, dir, n);
+      }
+    }
+  }
+
+  /**
    * Move one sticker from `def(col,row)` to its rotated position.
    * Reads from the pristine state, writes into `this.scratch`.
+   * Fallback path used only when {@link deriveMap} rejects its model.
    */
   private moveCell(
     def: FaceDef,
+    targetDef: FaceDef,
     col: number,
     row: number,
     value: number,
@@ -286,11 +411,7 @@ export class CubeState {
     const coords = this.coordBuf;
     faceCellCoords(def, col, row, n, coords);
     rotateCoords(coords, axis, dir, n);
-
-    const normal = rotateFaceNormal(def, axis, dir);
-    const target = faceForNormal(normal.axis, normal.max);
-    const targetDef = FACE_DEFS[target];
-    this.scratch[target][faceRow(targetDef, coords, n) * n + faceCol(targetDef, coords, n)] = value;
+    this.scratch[targetDef.name][faceRow(targetDef, coords, n) * n + faceCol(targetDef, coords, n)] = value;
   }
 
   /**
