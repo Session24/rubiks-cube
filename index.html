@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="Интерактивный 3D Rubik's Cube: размеры от 2×2×2 до 1000×1000×1000, физическая анимация слоёв и вычислительный solver." />
+    <title>3D Rubik's Cube</title>
+  </head>
+  <body>
+    <div id="app">
+      <div id="stage"></div>
+
+      <aside class="panel panel-left">
+        <header class="brand">
+          <h1>3D Rubik's Cube</h1>
+          <p>N×N×N до 1000 · WebGL2</p>
+        </header>
+
+        <section class="group">
+          <label class="label" for="size-input">Размер</label>
+          <div class="row">
+            <input id="size-range" type="range" min="2" max="1000" step="1" value="3" />
+            <input id="size-input" type="number" min="2" max="1000" step="1" value="3" />
+          </div>
+          <div id="size-label" class="value">3 × 3 × 3</div>
+        </section>
+
+        <section class="group">
+          <label class="label" for="moves-input">Количество ходов</label>
+          <div class="row">
+            <input id="moves-input" type="number" min="1" max="200" step="1" value="25" />
+            <span class="hint">перемешивания</span>
+          </div>
+        </section>
+
+        <section class="group">
+          <span class="label">Скорость</span>
+          <div class="segmented" id="speed-group">
+            <button type="button" data-speed="0.5">0.5x</button>
+            <button type="button" data-speed="1" class="active">1x</button>
+            <button type="button" data-speed="2">2x</button>
+            <button type="button" data-speed="4">4x</button>
+          </div>
+        </section>
+
+        <section class="actions">
+          <button id="btn-scramble" class="btn btn-primary" type="button">ПЕРЕМЕШАТЬ</button>
+          <button id="btn-solve" class="btn btn-accent" type="button">СОБРАТЬ</button>
+          <div class="row">
+            <button id="btn-reset" class="btn" type="button">СБРОСИТЬ</button>
+            <button id="btn-pause" class="btn" type="button" disabled>ПАУЗА</button>
+          </div>
+          <button id="btn-debug" class="btn btn-ghost" type="button">ОТЛАДКА</button>
+        </section>
+      </aside>
+
+      <aside class="panel panel-right">
+        <section class="group">
+          <span class="label">Состояние</span>
+          <div id="status-state" class="state state-solved">Собран</div>
+        </section>
+
+        <section class="group">
+          <span class="label">Текущий ход</span>
+          <div id="status-move" class="mono strong">—</div>
+          <div id="status-moves" class="mono sub">Ход: —</div>
+        </section>
+
+        <section class="group">
+          <span class="label">Прогресс</span>
+          <div class="bar"><div id="status-bar" class="bar-fill"></div></div>
+          <div id="status-percent" class="mono sub">0%</div>
+        </section>
+
+        <section class="group">
+          <span class="label">Вычисление</span>
+          <div id="solver-message" class="sub">Готово</div>
+        </section>
+
+        <div id="warning" class="warning" hidden></div>
+      </aside>
+
+      <pre id="debug" class="debug" hidden></pre>
+
+      <div id="fatal" class="fatal" hidden></div>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
